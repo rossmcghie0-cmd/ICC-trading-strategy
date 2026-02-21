@@ -1,0 +1,345 @@
+//@version=6
+strategy("3-Phase Continuation (Rules-Enforced) — 1H Context, 5m Entry, 1m Execution (optional)", overlay=true, pyramiding=0, calc_on_order_fills=true, calc_on_every_tick=false, initial_capital=50000)
+
+//========================
+// Inputs
+//========================
+// Step 0 / 6 - Safety + session
+grpSafety = "Step 0/6 - Safety Gates & Daily Limits"
+sessionInput = input.session("0830-1500", "Session (exchange time)", group=grpSafety)
+maxTradesPerDay = input.int(3, "Max trades per day", minval=1, group=grpSafety)
+maxDailyLossCurrency = input.float(300, "Max daily loss (currency)", minval=0, group=grpSafety)
+
+// Step 1/2 - 1H context
+grpContext = "Step 1/2 - 1H Context (Swings + 3-Phase)"
+contextTf = input.timeframe("60", "Context timeframe", group=grpContext)
+pivotLen = input.int(5, "Pivot length", minval=1, group=grpContext)
+pullMinBars = input.int(1, "1H correction min bars", minval=1, group=grpContext)
+pullMaxBars = input.int(10, "1H correction max bars", minval=1, group=grpContext)
+
+// Step 3 - 5m strong candle
+grpStrong = "Step 3 - 5m Strong Candle"
+entryTf = input.timeframe("5", "Entry timeframe", group=grpStrong)
+lookbackBreak = input.int(5, "Break lookback bars", minval=1, group=grpStrong)
+bodyPct = input.float(0.60, "Min body % of range", minval=0.0, maxval=1.0, group=grpStrong)
+closePortion = input.float(0.20, "Close-in-extreme portion", minval=0.0, maxval=0.5, group=grpStrong)
+breakMode = input.string("Wick", "Break mode", options=["Wick", "Close"], group=grpStrong)
+
+// Step 4 - Pullback + entry
+grpEntry = "Step 4 - 5m Pullback + Entry"
+pbMinBars = input.int(1, "Pullback min bars", minval=1, group=grpEntry)
+pbMaxBars = input.int(6, "Pullback max bars", minval=1, group=grpEntry)
+pbRetracePct = input.float(0.50, "Pullback min retrace %", minval=0.0, maxval=1.0, group=grpEntry)
+entryMode = input.string("Stop break", "Entry mode", options=["Stop break", "Close confirmation"], group=grpEntry)
+entryBufferTicks = input.int(1, "Entry buffer ticks", minval=0, group=grpEntry)
+invalidationMode = input.string("Wick", "Strong candle invalidation by", options=["Wick", "Body"], group=grpEntry)
+useExecutionTf = input.bool(false, "Enable 1m execution timing", group=grpEntry)
+executionTf = input.timeframe("1", "Execution timeframe", group=grpEntry)
+
+// Step 5 - Risk
+grpRisk = "Step 5 - Risk"
+qty = input.float(1, "Order size", minval=0.0, group=grpRisk)
+slTicks = input.int(20, "Stop loss ticks", minval=1, group=grpRisk)
+tpTicks = input.int(40, "Take profit ticks", minval=1, group=grpRisk)
+useRRGate = input.bool(false, "Enable min RR gate", group=grpRisk)
+rrMin = input.float(1.0, "Minimum RR", minval=0.0, group=grpRisk)
+
+// Step 8 - Visuals
+grpVis = "Step 8 - Visuals/Alerts"
+show1HSwings = input.bool(true, "Show 1H swings", group=grpVis)
+showIndicationBody = input.bool(true, "Show indication candle body", group=grpVis)
+showArmedBG = input.bool(true, "Show continuation armed background", group=grpVis)
+
+//========================
+// HTF/LTF series (non-repainting via lookahead_off)
+//========================
+hTime = request.security(syminfo.tickerid, contextTf, time, lookahead=barmerge.lookahead_off)
+hOpen = request.security(syminfo.tickerid, contextTf, open, lookahead=barmerge.lookahead_off)
+hHigh = request.security(syminfo.tickerid, contextTf, high, lookahead=barmerge.lookahead_off)
+hLow = request.security(syminfo.tickerid, contextTf, low, lookahead=barmerge.lookahead_off)
+hClose = request.security(syminfo.tickerid, contextTf, close, lookahead=barmerge.lookahead_off)
+hPivotHigh = request.security(syminfo.tickerid, contextTf, ta.pivothigh(high, pivotLen, pivotLen), lookahead=barmerge.lookahead_off)
+hPivotLow = request.security(syminfo.tickerid, contextTf, ta.pivotlow(low, pivotLen, pivotLen), lookahead=barmerge.lookahead_off)
+newHBar = ta.change(hTime) != 0
+
+eTime = request.security(syminfo.tickerid, entryTf, time, lookahead=barmerge.lookahead_off)
+eOpen = request.security(syminfo.tickerid, entryTf, open, lookahead=barmerge.lookahead_off)
+eHigh = request.security(syminfo.tickerid, entryTf, high, lookahead=barmerge.lookahead_off)
+eLow = request.security(syminfo.tickerid, entryTf, low, lookahead=barmerge.lookahead_off)
+eClose = request.security(syminfo.tickerid, entryTf, close, lookahead=barmerge.lookahead_off)
+newEBar = ta.change(eTime) != 0
+
+xTime = request.security(syminfo.tickerid, executionTf, time, lookahead=barmerge.lookahead_off)
+newXBar = ta.change(xTime) != 0
+
+//========================
+// Persistent state
+//========================
+var float lastConfirmedSwingHigh = na
+var float priorConfirmedSwingHigh = na
+var float lastConfirmedSwingLow = na
+var float priorConfirmedSwingLow = na
+
+var int bias = 0 // 1 bull, -1 bear, 0 no-trade
+
+var bool hasIndication = false
+var float indOpen = na
+var float indHigh = na
+var float indLow = na
+var float indClose = na
+var float indBodyHigh = na
+var float indBodyLow = na
+
+var bool correctionActive = false
+var int correctionBars = 0
+var float corrHigh = na
+var float corrLow = na
+
+var bool continuationArmed = false
+
+var bool strongTracking = false
+var int strongDir = 0 // 1 buyer, -1 seller
+var float scHigh = na
+var float scLow = na
+var float scBodyHigh = na
+var float scBodyLow = na
+var float scRange = na
+var int pbBars = 0
+var bool pbRetraced = false
+var bool attemptUsed = false
+
+var int tradesToday = 0
+var float dayStartNet = na
+
+//========================
+// Step 6 - Day/session accounting
+//========================
+newDay = ta.change(time("D")) != 0
+if na(dayStartNet)
+    dayStartNet := strategy.netprofit
+if newDay
+    tradesToday := 0
+    dayStartNet := strategy.netprofit
+
+dayPnL = strategy.netprofit - dayStartNet
+inSession = not na(time(timeframe.period, sessionInput))
+
+// count filled entries
+openedNewPos = strategy.position_size != 0 and strategy.position_size[1] == 0
+if openedNewPos
+    tradesToday += 1
+
+maxTradesHit = tradesToday >= maxTradesPerDay
+dailyLossHit = dayPnL <= -maxDailyLossCurrency
+
+//========================
+// Step 1 + 2 - 1H phase machine, on 1H close only
+//========================
+if newHBar
+    ph = hPivotHigh[1]
+    pl = hPivotLow[1]
+    if not na(ph)
+        priorConfirmedSwingHigh := lastConfirmedSwingHigh
+        lastConfirmedSwingHigh := ph
+    if not na(pl)
+        priorConfirmedSwingLow := lastConfirmedSwingLow
+        lastConfirmedSwingLow := pl
+
+    bullBias = not na(lastConfirmedSwingHigh) and not na(priorConfirmedSwingHigh) and lastConfirmedSwingHigh > priorConfirmedSwingHigh
+    bearBias = not na(lastConfirmedSwingLow) and not na(priorConfirmedSwingLow) and lastConfirmedSwingLow < priorConfirmedSwingLow
+    bias := bullBias ? 1 : bearBias ? -1 : 0
+
+    hO = hOpen[1]
+    hH = hHigh[1]
+    hL = hLow[1]
+    hC = hClose[1]
+
+    // reset no-trade regime
+    if bias == 0
+        hasIndication := false
+        correctionActive := false
+        continuationArmed := false
+        strongTracking := false
+        attemptUsed := false
+
+    // 2A Indication
+    bullIndication = bias == 1 and not na(lastConfirmedSwingHigh) and hC > lastConfirmedSwingHigh
+    bearIndication = bias == -1 and not na(lastConfirmedSwingLow) and hC < lastConfirmedSwingLow
+
+    if bullIndication or bearIndication
+        hasIndication := true
+        correctionActive := true
+        continuationArmed := false
+        correctionBars := 0
+        corrHigh := na
+        corrLow := na
+        indOpen := hO
+        indHigh := hH
+        indLow := hL
+        indClose := hC
+        indBodyHigh := math.max(hO, hC)
+        indBodyLow := math.min(hO, hC)
+        strongTracking := false
+        attemptUsed := false
+
+    // 2B correction tracking / invalidation / timeout
+    if hasIndication and correctionActive
+        invalid = (bias == 1 and hC < indBodyLow) or (bias == -1 and hC > indBodyHigh)
+        if invalid
+            hasIndication := false
+            correctionActive := false
+            continuationArmed := false
+            strongTracking := false
+            attemptUsed := false
+        else
+            // correction candle = does not continue breakout immediately
+            isCorrectionBar = (bias == 1 and hC <= indHigh) or (bias == -1 and hC >= indLow)
+            if isCorrectionBar
+                correctionBars += 1
+                corrHigh := na(corrHigh) ? hH : math.max(corrHigh, hH)
+                corrLow := na(corrLow) ? hL : math.min(corrLow, hL)
+
+            if correctionBars > pullMaxBars
+                hasIndication := false
+                correctionActive := false
+                continuationArmed := false
+                strongTracking := false
+                attemptUsed := false
+
+    // 2C continuation trigger after valid correction
+    if hasIndication and correctionActive and correctionBars >= pullMinBars and correctionBars <= pullMaxBars and not continuationArmed
+        bullCont = bias == 1 and not na(corrHigh) and hC > corrHigh
+        bearCont = bias == -1 and not na(corrLow) and hC < corrLow
+        if bullCont or bearCont
+            continuationArmed := true
+            correctionActive := false
+            strongTracking := false
+            attemptUsed := false
+
+//========================
+// Step 0 - Global safety hard blocks
+//========================
+noOpenPos = strategy.position_size == 0
+safetyGate = inSession and not maxTradesHit and not dailyLossHit and noOpenPos and bias != 0
+entryAllowed = safetyGate and continuationArmed and not attemptUsed
+
+//========================
+// Step 3 + 4 + 7 - 5m strong candle and pullback (state on 5m close)
+//========================
+isBullStrong(_o, _h, _l, _c) =>
+    rng = _h - _l
+    body = math.abs(_c - _o)
+    topClose = _c >= _h - closePortion * rng
+    brkRef = request.security(syminfo.tickerid, entryTf, ta.highest(high[1], lookbackBreak), lookahead=barmerge.lookahead_off)
+    breakOk = breakMode == "Wick" ? _h > brkRef : _c > brkRef
+    _c > _o and rng > 0 and body >= bodyPct * rng and topClose and breakOk
+
+isBearStrong(_o, _h, _l, _c) =>
+    rng = _h - _l
+    body = math.abs(_c - _o)
+    botClose = _c <= _l + closePortion * rng
+    brkRef = request.security(syminfo.tickerid, entryTf, ta.lowest(low[1], lookbackBreak), lookahead=barmerge.lookahead_off)
+    breakOk = breakMode == "Wick" ? _l < brkRef : _c < brkRef
+    _c < _o and rng > 0 and body >= bodyPct * rng and botClose and breakOk
+
+if newEBar
+    eo = eOpen[1]
+    eh = eHigh[1]
+    el = eLow[1]
+    ec = eClose[1]
+
+    if entryAllowed and not strongTracking
+        bullSC = bias == 1 and isBullStrong(eo, eh, el, ec)
+        bearSC = bias == -1 and isBearStrong(eo, eh, el, ec)
+        if bullSC or bearSC
+            strongTracking := true
+            strongDir := bullSC ? 1 : -1
+            scHigh := eh
+            scLow := el
+            scBodyHigh := math.max(eo, ec)
+            scBodyLow := math.min(eo, ec)
+            scRange := eh - el
+            pbBars := 0
+            pbRetraced := false
+
+    else if strongTracking
+        pbBars += 1
+
+        if strongDir == 1
+            retraceLevel = scHigh - pbRetracePct * scRange
+            if el <= retraceLevel
+                pbRetraced := true
+            invalidLvl = invalidationMode == "Wick" ? scLow : scBodyLow
+            if ec < invalidLvl
+                strongTracking := false
+        if strongDir == -1
+            retraceLevel = scLow + pbRetracePct * scRange
+            if eh >= retraceLevel
+                pbRetraced := true
+            invalidLvl = invalidationMode == "Wick" ? scHigh : scBodyHigh
+            if ec > invalidLvl
+                strongTracking := false
+
+        if pbBars > pbMaxBars
+            strongTracking := false
+
+//========================
+// Step 4 - Entry trigger (5m-caused; optional 1m timing)
+//========================
+tick = syminfo.mintick
+longStop = scHigh + entryBufferTicks * tick
+shortStop = scLow - entryBufferTicks * tick
+
+rrOkLong = not useRRGate or ((tpTicks * tick) / (slTicks * tick) >= rrMin)
+rrOkShort = rrOkLong
+canConfirmPullback = strongTracking and pbBars >= pbMinBars and pbBars <= pbMaxBars and pbRetraced and entryAllowed
+
+placeLong = canConfirmPullback and strongDir == 1 and rrOkLong
+placeShort = canConfirmPullback and strongDir == -1 and rrOkShort
+
+if placeLong
+    if entryMode == "Stop break"
+        strategy.entry("L", strategy.long, qty=qty, stop=longStop)
+        attemptUsed := true
+    else
+        closeConf = useExecutionTf ? (newXBar and close > scHigh) : (newEBar and eClose[1] > scHigh)
+        if closeConf
+            strategy.entry("L", strategy.long, qty=qty)
+            attemptUsed := true
+
+if placeShort
+    if entryMode == "Stop break"
+        strategy.entry("S", strategy.short, qty=qty, stop=shortStop)
+        attemptUsed := true
+    else
+        closeConf = useExecutionTf ? (newXBar and close < scLow) : (newEBar and eClose[1] < scLow)
+        if closeConf
+            strategy.entry("S", strategy.short, qty=qty)
+            attemptUsed := true
+
+if attemptUsed
+    continuationArmed := false
+    strongTracking := false
+
+//========================
+// Step 5 - Fixed bracket risk rules
+//========================
+if strategy.position_size > 0
+    strategy.exit("L-Exit", from_entry="L", stop=strategy.position_avg_price - slTicks * tick, limit=strategy.position_avg_price + tpTicks * tick)
+if strategy.position_size < 0
+    strategy.exit("S-Exit", from_entry="S", stop=strategy.position_avg_price + slTicks * tick, limit=strategy.position_avg_price - tpTicks * tick)
+
+//========================
+// Step 8 - Visuals + alerts
+//========================
+plot(show1HSwings ? lastConfirmedSwingHigh : na, "1H Last Swing High", color=color.new(color.green, 0), style=plot.style_linebr)
+plot(show1HSwings ? lastConfirmedSwingLow : na, "1H Last Swing Low", color=color.new(color.red, 0), style=plot.style_linebr)
+plot(showIndicationBody ? indBodyHigh : na, "Indication Body High", color=color.new(color.aqua, 0), style=plot.style_linebr)
+plot(showIndicationBody ? indBodyLow : na, "Indication Body Low", color=color.new(color.orange, 0), style=plot.style_linebr)
+bgcolor(showArmedBG and continuationArmed ? color.new(color.blue, 88) : na)
+plotshape(newEBar and strongTracking and pbBars == 0, title="Strong Candle", style=shape.triangleup, location=location.abovebar, color=strongDir == 1 ? color.lime : color.red, size=size.tiny)
+
+alertcondition(continuationArmed, "Continuation Armed", "1H continuation phase armed.")
+alertcondition(newEBar and strongTracking and pbBars == 0, "Strong Candle Detected", "5m strong candle detected.")
+alertcondition(openedNewPos, "Entry Triggered", "Strategy entry triggered.")
+alertcondition(maxTradesHit or dailyLossHit, "Daily Stop Hit", "Trading disabled by daily limits.")
